@@ -1,0 +1,36 @@
+# ---- ESP-IDF build artifacts ----
+build/
+build_c5/
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# NOTE: Alice/sdkconfig and Bob/sdkconfig ARE intentionally committed
+# to lock the exact build configuration used in the experiments.
+# sdkconfig.defaults is the hand-written minimal configuration.
+
+# ---- Experiment data & logs (large, machine-specific paths) ----
+results/
+connection_logs/
+launcher_logs/
+build_check.log
+memory/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- Compiled / firmware binaries ----
+*.elf
+*.a
+*.map
+*.bin
+*.rgb
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

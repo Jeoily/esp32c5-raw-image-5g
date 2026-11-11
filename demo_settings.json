@@ -1,0 +1,7 @@
+{
+  "alice_port": "COM3",
+  "bob_port": "COM4",
+  "idf_path": "C:\\esp\\v6.0\\esp-idf",
+  "idf_tools_path": "C:\\Espressif\\tools",
+  "idf_python": "C:\\Espressif\\tools\\python\\v6.0\\venv\\Scripts\\python.exe"
+}
