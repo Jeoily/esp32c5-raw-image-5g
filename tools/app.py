@@ -60,7 +60,7 @@ class ImageApp(tk.Tk):
         self.serial_baseline = 0
         self.host_baseline = 0
         self.transport_broken = False
-        self.board_stats = [0] * 5
+        self.board_stats = [0] * 6
         self.drop_baseline = 0
         self.final_summary = None
         self.last_render = 0
@@ -121,7 +121,8 @@ class ImageApp(tk.Tk):
             label = ttk.Label(group, text="等待图像", anchor="center")
             label.pack(fill="both", expand=True)
             self.previews[key] = label
-        ttk.Label(self, text="误码率仅统计已收到且可匹配的字节。错误像素保留；完全缺失的块不会用原图补齐。结果中另存缺失掩码和错误位置图。",
+        ttk.Label(self, text="条件BER只统计已通过头校验的已收到载荷，丢包与坏头不计入；请以空口丢包率、本端FCS失败率、头损坏率为主判据。"
+                  "错误像素保留，缺失块不用原图补齐。结果另存缺失掩码、错误位置图，以及FCS失败帧的原始误码图 raw_error.png。",
                   wraplength=1180).pack(anchor="w", padx=16, pady=5)
         self.logbox = tk.Text(self, height=9, wrap="word")
         self.logbox.pack(fill="x", padx=16, pady=8)
@@ -372,9 +373,13 @@ class ImageApp(tk.Tk):
         if role == "Bob" and line.startswith("!RX "):
             try:
                 fields_hint = parse_record(line)
-                raw = bytes.fromhex(fields_hint[-1])
-                if len(raw) >= 36:
-                    target = self.draining.get(struct.unpack_from('<I', raw, 32)[0])
+                # Field 9 is the hex payload in both the old 10-field record
+                # and the new record with trailing PHY metadata. Using [-1]
+                # would silently break multi-round routing with the new format.
+                if len(fields_hint) >= 10:
+                    raw = bytes.fromhex(fields_hint[9])
+                    if len(raw) >= 36:
+                        target = self.draining.get(struct.unpack_from('<I', raw, 32)[0])
             except (ValueError, IndexError):
                 pass
         logfile = target['log'] if target else self.capture_log
@@ -412,7 +417,10 @@ class ImageApp(tk.Tk):
         elif tag == "BOOT":
             self.log(role + "初始化 " + " ".join(fields[1:]))
         elif tag == "STATS" and role == "Bob":
-            self.board_stats = list(map(int, fields[1:]))
+            values = list(map(int, fields[1:]))
+            # Old firmware reports 5 counters, new firmware 6 (adds the count
+            # of filtered foreign frames). Keep index 3 = dropped in both.
+            self.board_stats = values + [0] * (6 - len(values))
         elif tag == "ERROR":
             self.log(role + " " + " ".join(fields))
             self.status.set(role + " " + " ".join(fields))
@@ -459,6 +467,7 @@ class ImageApp(tk.Tk):
         result.update(self.rssi.summary())
         result.update(serial_record_errors=self.serial_errors-self.serial_baseline, host_queue_drops=self.host_drops-self.host_baseline,
             bob_queue_drops=max(0, self.board_stats[3]-self.drop_baseline),
+            foreign_frames_filtered_lifetime=self.board_stats[5],
             transport_broken=self.transport_broken, bob_lifetime_counters=list(self.board_stats))
         duration = (self.last_tx_time - self.first_tx_time
                     if self.first_tx_time is not None and self.last_tx_time is not None else 0)
@@ -482,7 +491,14 @@ class ImageApp(tk.Tk):
         result = context['result']
         result.update(context['run'].summary())
         result.update(context['rssi'].summary())
-        result['bob_queue_drops'] = max(0, self.board_stats[3] - context['drop_baseline'])
+        # Snapshot the counters at this round's close instead of leaving the
+        # detach-time values in place. Loop rounds use overlapping observation
+        # windows, so the value is explicitly marked and must not be summed.
+        at_close = list(self.board_stats)
+        result['bob_counters_at_close'] = at_close
+        result['bob_queue_drops'] = max(0, at_close[3] - context['drop_baseline'])
+        result['bob_queue_drops_overlapping_window'] = True
+        result['foreign_frames_filtered_lifetime'] = at_close[5]
         result['serial_record_errors'] = self.serial_errors - context['serial_baseline']
         result['host_queue_drops'] = self.host_drops - context['host_baseline']
         result['background_tail_seconds'] = 3
@@ -520,6 +536,8 @@ class ImageApp(tk.Tk):
             note = "未取得有效图像载荷，无法绘制接收图像"
         else:
             note = f"收到{result['unique_received']}/{result['total_blocks']}块，错误像素{result['pixel_errors']}，缺失块{result['missing_blocks']}"
+        if result.get("local_fcs_fail_frames"):
+            note += f"；本端FCS失败帧{result['local_fcs_fail_frames']}，原始误码块{result.get('raw_fcs_error_blocks', 0)}（见 raw_error.png）"
         if result["zero_state_payload_error_frames"]:
             note += "；存在接收状态正常但载荷不一致的块，请复核日志，不能直接归因于无线误码"
         self.status.set(reason + " · " + note)
@@ -583,10 +601,22 @@ class ImageApp(tk.Tk):
         if self.run:
             result = self.final_summary if self.final_summary is not None else self.snapshot()
             ber = "—" if result["conditional_ber"] is None else f"{100*result['conditional_ber']:.5f}%"
+            per = result.get("packet_error_rate")
+            per_text = "—" if per is None else f"{100*per:.1f}%"
+            fcs_rate = result.get("local_fcs_fail_rate")
+            fcs_text = "—" if fcs_rate is None else f"{100*fcs_rate:.2f}%"
+            head_rate = result.get("header_corrupt_rate")
+            head_text = "—" if head_rate is None else f"{100*head_rate:.2f}%"
+            rate_hist = result.get("phy_rate_mbps_histogram") or {}
+            rate_text = ",".join(f"{k}Mbps×{v}" for k, v in sorted(rate_hist.items())) or "—"
             self.progress["value"] = 100 * result["received_bytes"] / result["total_bytes"]
-            self.metrics.set(f"已提交 {result['api_accepted']}/{result['total_blocks']}块    收到 {result['unique_received']}块    接收覆盖 {100*result['received_bytes']/result['total_bytes']:.1f}%\n"
-                f"错误载荷块 {result['payload_error_frames']}    错误位 {result['bit_errors']}    错误像素 {result['pixel_errors']}    已接收载荷误码率 {ber}\n"
-                f"串口错误 {result['serial_record_errors']}    Bob队列丢弃 {result['bob_queue_drops']}    电脑队列丢弃 {result['host_queue_drops']}")
+            self.metrics.set(
+                f"已提交 {result['api_accepted']}/{result['total_blocks']}块    收到 {result['unique_received']}块    接收覆盖 {100*result['received_bytes']/result['total_bytes']:.1f}%\n"
+                f"空口丢包率 {per_text}    本端FCS失败 {result.get('local_fcs_fail_frames', 0)}/{result.get('local_frames', 0)} ({fcs_text})    头损坏率 {head_text}    原始误码块 {result.get('raw_fcs_error_blocks', 0)}\n"
+                f"条件载荷BER {ber}（仅已通过头校验的载荷）    串口错误 {result['serial_record_errors']}    Bob队列丢弃 {result['bob_queue_drops']}    电脑队列丢弃 {result['host_queue_drops']}\n"
+                f"实测PHY速率 {rate_text}    过滤环境帧 {result.get('foreign_frames_filtered_lifetime', 0)}")
+            if result.get("phy_metadata_samples", 0) == 0 and result['unique_received'] > 0:
+                self.metrics.set(self.metrics.get() + "    注意：未收到PHY元数据，当前两端为旧固件，请重新烧录")
             if result.get("approx_payload_bps") is not None:
                 self.metrics.set(self.metrics.get() + f"    提交耗时 {result['tx_ack_span_seconds']:.1f}s / 约 {result['approx_payload_bps']/1000:.1f} kbit/s")
         if self.active and self.finish_at and now >= self.finish_at and self.events.empty():

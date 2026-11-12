@@ -35,8 +35,23 @@
 - Bob 保留可识别数据块的首次接收载荷，包括接收状态异常但仍能读到的载荷；载荷中的错误位直接变成错误颜色。
 - 深灰色是尚未收到或无法可靠定位的数据块，不是人为生成的无线错误。开始阶段全部缺失，后续逐块填入；最终仍缺失的位置继续保持深灰色。
 - 地址、会话号或定位头损坏时，该块不会被随意放入图像，表现为缺失。完全收不到无线信号时，通常表现为空缺，而不是必然出现雪花。
+- FCS 失败且定位头也损坏的帧进不了主接收画面。它们的**原始载荷**会另存为 `raw_error.png`（以及 `raw_error_mask.png` 标出位置）：绕过应用头 CRC 准入门槛、按序号尽力归位，只用于诊断显示，绝不回填或修补 `received.png`。其中 `local_hint=8` 的块属于弱归属候选，可信度低于 MAC/magic 匹配的块。
 - 原图只用于左侧展示和诊断比较，不用于生成 Bob 接收画面。每轮新会话隔离旧包，重复包不修复首次收到的像素。
 - 接收进度条表示**已收到字节的覆盖率**，不是发送完成度；存在丢失时，发送结束后也不会达到 100%。
+
+### 分层统计（2026-11-11 新增）
+
+802.11 的 FCS 一旦通过，载荷几乎必然逐字节正确，所以 `conditional_ber` 在这类链路上容易恒为 0，不能单独当作信道质量结论。请以这几个量为主判据，它们在 `summary.json` 和界面上同时给出：
+
+| 字段 | 含义 |
+|---|---|
+| `packet_error_rate` | 空口丢包率，分母为已提交的块数；丢帧不进 BER，但进这里 |
+| `local_frames` / `local_fcs_fail_frames` / `local_fcs_fail_rate` | 固件判为本端的帧数、其中 `rx_state` 非零的帧数及占比 |
+| `header_corrupt_rate` | 应用头 CRC 失败占本端帧的比例 |
+| `raw_fcs_error_blocks` | 从 FCS 失败帧尽力归位、画进 `raw_error.png` 的块数 |
+| `phy_rate_mbps_histogram` 等 | 接收端实测的 L-SIG 速率、BB 格式、带宽、噪声底，用来核对"固定 6 Mbps"是否真的生效 |
+
+`conditional_ber` 保留，但新增 `conditional_ber_scope` 明确写出分母范围（仅已提交、已收到且头 CRC 通过的载荷位）。`rx_state` 的非零值是芯片未公开的错误码，不能一概叫作 FCS 失败。
 
 这里展示的是 **Wi-Fi 物理层纠错之后仍残留的载荷错误**，不是绕过 ESP32 物理层编码的完全“无码”通信。此前 probe_v3 的遮挡实验已经捕获了错误载荷，但不能保证每次遮挡都出现同样的误码：轻度衰落可能仍正确，严重衰落可能直接丢包，绕射或泄漏也可能保持通信。
 
@@ -59,7 +74,9 @@ summary.json包含 rssi_samples、rssi_last_dbm、rssi_mean_dbm、rssi_min_dbm�
 | received.rgb | 同一接收画面的 RGB888 原始字节，尺寸见结果记录 |
 | missing_mask.png | 白色为缺失像素，黑色为已接收像素 |
 | error_map.png | 红色为与原图不同的像素，绿色为一致，灰色为缺失；仅用于诊断 |
-| summary.json | 提交块数、接收块数、错误位、错误像素、队列丢弃和串口错误等 |
+| raw_error.png | FCS 失败帧的原始载荷尽力归位后的画面，头损坏块也会显示；不修改主接收图 |
+| raw_error_mask.png | 白色为 `raw_error.png` 中来自 FCS 失败帧的块 |
+| summary.json | 提交块数、接收块数、错误位、错误像素、分层统计、PHY 元数据、队列丢弃和串口错误等 |
 | records.jsonl | 本轮带时间和角色的原始串口记录 |
 | settings.json | 图片、尺寸、间隔、功率请求和两端身份 |
 
@@ -79,6 +96,18 @@ summary.json包含 rssi_samples、rssi_last_dbm、rssi_mean_dbm、rssi_min_dbm�
 - 本机环境：ESP-IDF v6.0，`C:\esp\v6.0\esp-idf`，Python `C:\Espressif\tools\python\v6.0\venv\Scripts\python.exe`。Python 需要 Pillow、pyserial 和 Tk；本机已可运行。
 - 更换电脑时先修改 `demo_settings.json` 中环境路径。不要复制旧项目的构建缓存覆盖本项目。
 - 如需恢复旧可靠传图功能，重新烧录 `alice_bob_oneway_5g` 对应的两端固件并启动其界面；旧项目未被本项目修改。
+
+## 固件更新说明（2026-11-11）
+
+本次只改了 `shared/link.c`（Bob 侧采集链）和电脑端程序，**无线发送方式、6 Mbps 速率配置的调用时机、功率上限、加密与 X 极化都没有改**。新功能全部落在 Bob 的接收采集链，**必须重新烧录 Bob**；Alice 的发射行为未变，但 `shared/link.c` 是共用文件，建议两端一起重新编译烧录以保持版本一致。仅编译不烧录已完成验证：Alice 0xd9d80 字节、Bob 0xd8890 字节，均无编译器 warning/error，均留约 15% 应用分区余量。界面仍接受旧固件，但会在指标区提示"未收到 PHY 元数据，请重新烧录"，旧固件下不会有分层统计和 `raw_error.png`。
+
+固件的三处行为变化：
+
+1. **只输出本端帧**。以前 `rx_state` 非零的帧无条件入队，环境里的坏帧（beacon、ACK、其它设备）淹没 921600 串口，把单核 C5 的 `capture_output` 占满、`IDLE` 饿死、触发 `task_wdt`，看门狗文本又插进 `!RX` 记录造成 CRC 失败。现在非本端帧仅计数（`STATS` 第 6 个字段 `foreign_frames`），不打印。本端帧即使 FCS 失败也保留，供 `raw_error.png` 使用。
+2. **STATS 独立任务 + `capture_output` 周期性让出 CPU**。此前 16 轮循环期间 STATS 整整 39 秒不上报，导致 `bob_queue_drops` 出现成片的假 0。`CONFIG_FREERTOS_HZ=100`，`vTaskDelay(1)` 最多 10 ms，逐帧让出会把输出压到 100 帧/秒反而更堵，因此改为每 16 帧让出一次（约每 100 ms 给 IDLE 和计数器一个时间窗，远小于 5 s 看门狗），并把 `stats_output` 优先级设为 3、高于 `capture_output` 的 2。串口波特率未改，0 ms 快速模式下 921600 的吞吐上限仍在，这一步只保证统计可信，不等于消除所有本地丢弃。
+3. **RX 记录追加可选 PHY 字段**。前 10 个字段完全不变，旧的 `records.jsonl` 仍可读；新增 `rate / bb_format / second / noise_floor / he_siga1 / local_hint` 六个字段。C5 的 `esp_wifi_rxctrl_t` 没有旧款 ESP32 的 `mcs/sig_mode/cwb`，所以记录的是 L-SIG RATE 等原始值；`phy_rate_mbps_histogram` 是按 802.11a 标准 RATE 字段推断的 Mbps，标注为推断值，不是驱动承诺。`local_hint` 位含义：1=源 MAC 完全匹配、2=magic 匹配、4=MAC 前缀＋长度、8=仅凭长度与失败状态的弱候选。
+
+`STATS` 由 5 个计数变成 6 个（新增 `foreign_frames`），前 5 个含义不变。`bob_queue_drops` 在循环模式下仍使用重叠观察窗口，`summary.json` 里以 `bob_queue_drops_overlapping_window` 标注，**各轮不能相加**；同时新增 `bob_counters_at_close` 保存该轮收尾时的累计值，便于逐轮复核。
 
 ## 已完成的检查（2026-11-10）
 

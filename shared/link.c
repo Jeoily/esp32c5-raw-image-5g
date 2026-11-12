@@ -17,14 +17,15 @@
 
 #define CHANNEL 40
 #define PAYLOAD_SIZE 240
-#define FRAME_SIZE (24 + 32 + PAYLOAD_SIZE)
+#define HEADER_SIZE 32
+#define FRAME_SIZE (24 + HEADER_SIZE + PAYLOAD_SIZE)
 #define CAPTURE_SIZE 512
 static const uint8_t magic[8] = {'C','5','I','M','G','0','0','1'};
 static SemaphoreHandle_t output_lock;
 static QueueHandle_t captures;
 static uint8_t own_mac[6], peer_mac[6];
 static bool have_peer;
-static uint32_t seen, failed, misc, dropped, invalid_length;
+static uint32_t seen, failed, misc, dropped, invalid_length, foreign_frames;
 static uint32_t current_run, total_bytes, next_sequence;
 static uint16_t image_width, image_height;
 static bool running;
@@ -81,45 +82,80 @@ static void fill_frame(uint8_t *frame, uint32_t sequence, const uint8_t *pixels,
     memcpy(frame + 56, pixels, length);
 }
 
+/* PHY metadata available on the C5 (esp_wifi_rxctrl_t, Wi-Fi MAC version 3).
+   The older mcs/sig_mode/cwb fields do not exist on this target; the raw
+   L-SIG rate, BB format, secondary channel, noise floor and HE-SIGA1 are
+   recorded instead so the host can check which rate really went over the air. */
 typedef struct {
     uint32_t timestamp;
     uint16_t sig_len, dump_len, copied;
     uint8_t type, state, channel;
     int8_t rssi;
+    uint8_t rate, bb_format, second, local_hint;
+    int8_t noise_floor;
+    uint32_t he_siga1;
     uint8_t bytes[CAPTURE_SIZE];
 } capture_t;
 
+/* Only frames that plausibly belong to this experiment enter the output queue.
+   Foreign bad frames (beacons, ACKs, unrelated STAs) are counted but never
+   printed: they used to flood the UART, starve the IDLE task and trigger the
+   task watchdog, which in turn corrupted !RX records. Frames from our own
+   transmitter are kept even when rx_state != 0 so damaged payloads can be
+   rendered by the host's raw-error image. */
+static uint8_t classify_frame(const uint8_t *payload, const capture_t *item) {
+    bool mac_full = item->copied >= 16 && have_peer && !memcmp(payload + 10, peer_mac, 6);
+    bool magic_ok = item->copied >= 32 && !memcmp(payload + 24, magic, 8);
+    bool mac_prefix = item->copied >= 13 && have_peer && !memcmp(payload + 10, peer_mac, 3);
+    /* Our MPDU is 24 + 32 + up to 240 bytes; sig_len includes the 4-byte FCS. */
+    bool plausible = item->sig_len >= (24 + HEADER_SIZE + 1) && item->sig_len <= FRAME_SIZE + 4;
+    /* A badly damaged header may lose the MAC or magic. Keep long failing DATA
+       frames as weak candidates; the host applies its own lenient checks. */
+    bool weak = item->state != 0 && plausible && item->copied >= 56;
+    return (mac_full ? 1 : 0) | (magic_ok ? 2 : 0) |
+           ((mac_prefix && plausible) ? 4 : 0) | (weak ? 8 : 0);
+}
+
 static void receive_packet(void *buffer, wifi_promiscuous_pkt_type_t type) {
     const wifi_promiscuous_pkt_t *packet = buffer;
+    const wifi_pkt_rx_ctrl_t *ctrl = &packet->rx_ctrl;
     __atomic_add_fetch(&seen, 1, __ATOMIC_RELAXED);
-    if (packet->rx_ctrl.rx_state) __atomic_add_fetch(&failed, 1, __ATOMIC_RELAXED);
+    if (ctrl->rx_state) __atomic_add_fetch(&failed, 1, __ATOMIC_RELAXED);
     if (type == WIFI_PKT_MISC) __atomic_add_fetch(&misc, 1, __ATOMIC_RELAXED);
     capture_t item = {0};
-    item.timestamp = packet->rx_ctrl.timestamp;
-    item.sig_len = packet->rx_ctrl.sig_len;
-    item.dump_len = packet->rx_ctrl.dump_len;
-    item.state = packet->rx_ctrl.rx_state;
-    item.rssi = packet->rx_ctrl.rssi;
-    item.channel = packet->rx_ctrl.channel;
+    item.timestamp = ctrl->timestamp;
+    item.sig_len = ctrl->sig_len;
+    item.dump_len = ctrl->dump_len;
+    item.state = ctrl->rx_state;
+    item.rssi = ctrl->rssi;
+    item.channel = ctrl->channel;
     item.type = type;
+    item.rate = ctrl->rate;
+    item.bb_format = ctrl->cur_bb_format;
+    item.second = ctrl->second;
+    item.noise_floor = ctrl->noise_floor;
+    item.he_siga1 = ctrl->he_siga1;
 
     /* MISC has no documented payload. Never read beyond its metadata.
        On the tested C5 SDK the reported dump_len is sig_len + 4, opposite
-       to the header comment. Accept either FCS-length convention, copying
-       only the smaller reported size. Keep unrelated length discrepancies
-       as metadata, never guess a full frame size or read past either bound. */
+       to the header comment. Accept either FCS-length convention. sig_len
+       includes the FCS, so cap the copy at FRAME_SIZE to drop those 4 bytes. */
     bool payload_type = type == WIFI_PKT_DATA || type == WIFI_PKT_MGMT || type == WIFI_PKT_CTRL;
     unsigned smaller = item.dump_len < item.sig_len ? item.dump_len : item.sig_len;
     unsigned difference = item.dump_len > item.sig_len ? item.dump_len - item.sig_len : item.sig_len - item.dump_len;
     if (payload_type && smaller > 0 && (difference == 0 || difference == 4)) {
-        item.copied = smaller < CAPTURE_SIZE ? smaller : CAPTURE_SIZE;
-        bool matches = item.copied >= 16 && have_peer && !memcmp(packet->payload + 10, peer_mac, 6);
-        bool marker = item.copied >= 32 && !memcmp(packet->payload + 24, magic, 8);
-        if (!item.state && !matches && !marker) return;
+        unsigned bound = smaller < FRAME_SIZE ? smaller : FRAME_SIZE;
+        item.copied = bound < CAPTURE_SIZE ? bound : CAPTURE_SIZE;
+        item.local_hint = classify_frame(packet->payload, &item);
+        if (!item.local_hint) {
+            __atomic_add_fetch(&foreign_frames, 1, __ATOMIC_RELAXED);
+            return;
+        }
         memcpy(item.bytes, packet->payload, item.copied);
     } else {
         if (payload_type) __atomic_add_fetch(&invalid_length, 1, __ATOMIC_RELAXED);
-        if (!item.state && type != WIFI_PKT_MISC) return;
+        __atomic_add_fetch(&foreign_frames, 1, __ATOMIC_RELAXED);
+        return;
     }
     if (xQueueSend(captures, &item, 0) != pdTRUE)
         __atomic_add_fetch(&dropped, 1, __ATOMIC_RELAXED);
@@ -128,6 +164,7 @@ static void receive_packet(void *buffer, wifi_promiscuous_pkt_type_t type) {
 static void capture_output(void *arg) {
     capture_t item;
     char hex[CAPTURE_SIZE * 2 + 1];
+    unsigned since_yield = 0;
     const char digits[] = "0123456789abcdef";
     while (1) {
         if (xQueueReceive(captures, &item, portMAX_DELAY) != pdTRUE) continue;
@@ -136,9 +173,38 @@ static void capture_output(void *arg) {
             hex[2*i+1] = digits[item.bytes[i] & 15];
         }
         hex[item.copied * 2] = 0;
-        report("RX %" PRIu32 " %u %u %d %u %u %u %u %s", item.timestamp,
-               item.type, item.state, item.rssi, item.channel, item.sig_len,
-               item.dump_len, item.copied, item.copied ? hex : "-");
+        /* The first ten fields are unchanged for compatibility with old
+           records.jsonl. Trailing PHY fields are optional on the host side. */
+        report("RX %" PRIu32 " %u %u %d %u %u %u %u %s %u %u %u %d %" PRIu32 " %u",
+               item.timestamp, (unsigned)item.type, (unsigned)item.state, (int)item.rssi,
+               (unsigned)item.channel, (unsigned)item.sig_len, (unsigned)item.dump_len,
+               (unsigned)item.copied, item.copied ? hex : "-",
+               (unsigned)item.rate, (unsigned)item.bb_format, (unsigned)item.second,
+               (int)item.noise_floor, item.he_siga1, (unsigned)item.local_hint);
+        /* Single-core C5: a continuously non-empty queue used to starve the
+           IDLE task (task_wdt) and the 1 s counters. CONFIG_FREERTOS_HZ is
+           100, so vTaskDelay(1) costs up to 10 ms; yielding after every frame
+           would throttle output below the sender's pace. Yielding once every
+           16 frames still gives IDLE and the counters a slot roughly every
+           100 ms, far inside the 5 s watchdog, at ~0.3 ms/frame amortized. */
+        if (++since_yield >= 16) {
+            since_yield = 0;
+            vTaskDelay(1);
+        }
+    }
+}
+
+/* Independent task: STATS must keep reporting even while capture_output is
+   busy. Previously it lived in app_main and went silent for the whole 39 s
+   of a 16-round loop, making every bob_queue_drops value a false zero. */
+static void stats_output(void *arg) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        report("STATS %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
+            __atomic_load_n(&seen, __ATOMIC_RELAXED), __atomic_load_n(&failed, __ATOMIC_RELAXED),
+            __atomic_load_n(&misc, __ATOMIC_RELAXED), __atomic_load_n(&dropped, __ATOMIC_RELAXED),
+            __atomic_load_n(&invalid_length, __ATOMIC_RELAXED),
+            __atomic_load_n(&foreign_frames, __ATOMIC_RELAXED));
     }
 }
 
@@ -150,6 +216,8 @@ static void info(void) {
     uint8_t channel;
     wifi_second_chan_t secondary;
     ESP_ERROR_CHECK(esp_wifi_get_channel(&channel, &secondary));
+    /* Keep the identity string: the host accepts old and new firmware alike,
+       and reports missing PHY metadata instead of refusing to start. */
     report("INFO %s %u %02x%02x%02x%02x%02x%02x %s raw_image_v1", ROLE_ALICE ? "Alice" : "Bob",
            channel, own_mac[0], own_mac[1], own_mac[2], own_mac[3], own_mac[4], own_mac[5], esp_get_idf_version());
 }
@@ -179,9 +247,9 @@ static bool wifi_begin(void) {
     BOOT_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20));
     BOOT_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     BOOT_CHECK(esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE));
-    /* The installed C5 binary checks the started STA interface and current
-       band. Configure its raw rate only after both are established. If this
-       SDK rejects the call, report it and block RUN instead of guessing a rate. */
+    /* Keep the tested C5 order. Moving this before esp_wifi_start() triggers
+       the BOOT_FAILED observed on this hardware. The new PHY rate metadata
+       lets us verify the resulting rate without guessing. */
     if (ROLE_ALICE) {
         wifi_tx_rate_config_t rate = {.phymode = WIFI_PHY_MODE_11A, .rate = WIFI_PHY_RATE_6M};
         BOOT_CHECK(esp_wifi_config_80211_tx(WIFI_IF_STA, &rate));
@@ -304,11 +372,15 @@ void app_main(void) {
         boot_failed_step = "nvs_flash_init";
         report("ERROR BOOT_FAILED nvs_flash_init %s %d", esp_err_to_name(err), err);
     }
-    if (!ROLE_ALICE && radio_ready) xTaskCreate(capture_output, "capture_output", 8192, NULL, 4, NULL);
+    if (!ROLE_ALICE && radio_ready) {
+        xTaskCreate(capture_output, "capture_output", 8192, NULL, 2, NULL);
+        /* Higher than capture_output so the 1 s counters are never delayed
+           by a busy output queue (mutex priority inheritance handles report()). */
+        xTaskCreate(stats_output, "stats_output", 3072, NULL, 3, NULL);
+    }
     info();
     static char line[640]; size_t used = 0;
     bool discard_line = false;
-    TickType_t last_stats = xTaskGetTickCount();
     while (1) {
         uint8_t byte;
         if (uart_read_bytes(UART_NUM_0, &byte, 1, pdMS_TO_TICKS(10)) == 1) {
@@ -322,14 +394,6 @@ void app_main(void) {
                 if (used < sizeof(line)-1) line[used++] = byte;
                 else { discard_line = true; report("ERROR command_too_long"); }
             }
-        }
-        TickType_t now = xTaskGetTickCount();
-        if (!ROLE_ALICE && now - last_stats >= pdMS_TO_TICKS(1000)) {
-            last_stats = now;
-            report("STATS %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32,
-                __atomic_load_n(&seen, __ATOMIC_RELAXED), __atomic_load_n(&failed, __ATOMIC_RELAXED),
-                __atomic_load_n(&misc, __ATOMIC_RELAXED), __atomic_load_n(&dropped, __ATOMIC_RELAXED),
-                __atomic_load_n(&invalid_length, __ATOMIC_RELAXED));
         }
     }
 }

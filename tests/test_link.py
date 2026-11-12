@@ -231,5 +231,100 @@ class LinkTests(unittest.TestCase):
             finally:
                 window.close()
 
+def rx_new(raw, state=0, rate=0xB, bb_format=0, second=0,
+           noise_floor=-90, he_siga1=0, local_hint=1):
+    """16-field record produced by the updated firmware."""
+    return rx(raw, state) + [str(rate), str(bb_format), str(second),
+                             str(noise_floor), str(he_siga1), str(local_hint)]
+
+
+class LayeredStatisticsTests(unittest.TestCase):
+    def test_old_record_still_accepted(self):
+        source = Image.new('RGB', (160, 1), (1, 2, 3))
+        run = ImageRun(7, MAC, source)
+        run.submitted = {0}
+        run.receive(rx(encode_frame(7, 0, 160, 1, MAC, source.tobytes()[:240])))
+        summary = run.summary()
+        self.assertEqual(summary['phy_metadata_samples'], 0)
+        self.assertEqual(summary['local_frames'], 1)
+        self.assertEqual(summary['local_fcs_fail_frames'], 0)
+        self.assertEqual(summary['packet_error_rate'], 0)
+        self.assertEqual(summary['raw_fcs_error_blocks'], 0)
+        self.assertIn('丢包', summary['conditional_ber_scope'])
+        self.assertIsNone(run.receiver.raw_error_image())
+
+    def test_new_record_phy_histograms_and_per(self):
+        source = Image.new('RGB', (240, 1), (4, 5, 6))
+        run = ImageRun(7, MAC, source)
+        run.submitted = {0, 1, 2}
+        run.receive(rx_new(encode_frame(7, 0, 240, 1, MAC, source.tobytes()[:240]),
+                           state=0, rate=0xB, noise_floor=-92))
+        run.receive(rx_new(encode_frame(7, 1, 240, 1, MAC, source.tobytes()[240:480]),
+                           state=65, rate=0xB, noise_floor=-88, local_hint=9))
+        summary = run.summary()
+        self.assertEqual(summary['phy_metadata_samples'], 2)
+        self.assertEqual(summary['phy_rate_mbps_histogram'], {'6': 2})
+        self.assertEqual(summary['phy_second_histogram'], {'0': 2})
+        self.assertEqual(summary['phy_noise_floor_mean_dbm'], -90)
+        self.assertEqual(summary['local_frames'], 2)
+        self.assertEqual(summary['local_fcs_fail_frames'], 1)
+        self.assertEqual(summary['local_fcs_fail_rate'], 0.5)
+        self.assertEqual(summary['foreign_weak_candidates'], 1)
+        self.assertAlmostEqual(summary['packet_error_rate'], 1 / 3)
+        self.assertEqual(summary['raw_fcs_error_blocks'], 1)
+
+    def test_raw_error_image_uses_damaged_header_payload(self):
+        source = Image.new('RGB', (160, 1), (1, 2, 3))
+        run = ImageRun(7, MAC, source)
+        run.submitted = {0}
+        payload = bytes((200, 100, 50) * 80)
+        frame = bytearray(encode_frame(7, 0, 160, 1, MAC, payload))
+        frame[52] ^= 1  # corrupt the header CRC only
+        run.receive(rx_new(bytes(frame), state=65, local_hint=9))
+        # The strict gate must still reject it for the primary image.
+        self.assertIsNone(run.receiver.image())
+        self.assertEqual(run.summary()['header_corrupt'], 1)
+        # ... but raw_error.png shows the original, unverified bytes.
+        raw_image = run.receiver.raw_error_image()
+        self.assertIsNotNone(raw_image)
+        self.assertEqual(raw_image.getpixel((0, 0)), (200, 100, 50))
+        self.assertEqual(run.receiver.raw_error_mask().getpixel((79, 0)), 255)
+        self.assertEqual(run.summary()['raw_fcs_error_blocks'], 1)
+        self.assertEqual(run.summary()['local_fcs_fail_frames'], 1)
+
+    def test_raw_error_never_repairs_primary_image(self):
+        source = Image.new('RGB', (240, 1), (9, 9, 9))
+        run = ImageRun(7, MAC, source)
+        run.submitted = {0, 1}
+        damaged = bytearray(encode_frame(7, 0, 240, 1, MAC, bytes((7, 7, 7) * 80)))
+        damaged[52] ^= 1
+        run.receive(rx_new(bytes(damaged), state=65, local_hint=9))
+        run.receive(rx_new(encode_frame(7, 1, 240, 1, MAC, source.tobytes()[240:480]),
+                           state=0, local_hint=1))
+        primary = run.receiver.image()
+        self.assertEqual(primary.getpixel((0, 0)), MISSING_COLOR)
+        self.assertEqual(primary.getpixel((80, 0)), (9, 9, 9))
+        self.assertEqual(run.receiver.raw_error_image().getpixel((0, 0)), (7, 7, 7))
+
+    def test_gui_routes_new_format_to_draining_round(self):
+        # Call the unbound handler with a lightweight stand-in instead of
+        # creating a second Tk root, which would disturb the GUI test suite.
+        import io
+        import types
+        import app
+        old_run = ImageRun(7, MAC, Image.new('RGB', (160, 1), (1, 2, 3)))
+        old_run.submitted = {0}
+        stand_in = types.SimpleNamespace(
+            connection_log=None, capture_log=None, live_rssi=RssiTracker(),
+            draining={7: dict(run=old_run, log=io.StringIO(), rssi=RssiTracker(), result={})})
+        line = command_record(' '.join(rx_new(
+            encode_frame(7, 0, 160, 1, MAC, bytes((3, 4, 5) * 80)),
+            state=0, rate=0xB))).decode().strip()
+        app.ImageApp.handle(stand_in, 'Bob', line)
+        self.assertEqual(old_run.receiver.frames[0]['payload'][:3], b'\x03\x04\x05')
+        self.assertEqual(old_run.summary()['phy_rate_mbps_histogram'], {'6': 1})
+        self.assertIn('!RX', stand_in.draining[7]['log'].getvalue())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
